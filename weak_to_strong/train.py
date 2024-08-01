@@ -2,6 +2,8 @@ import itertools
 import os
 import pickle
 import time
+import math
+from distutils.dir_util import copy_tree
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -27,6 +29,7 @@ class ModelConfig:
     gradient_checkpointing: bool = False
     model_parallel: bool = False
     default_optimizer: str = "adam"
+    minibatch_size_per_device: int = 1
 
 
 def train_model(
@@ -44,8 +47,11 @@ def train_model(
     train_with_dropout: bool = False,
     epochs: int = 1,
     lr_schedule: str = "cosine_anneal",
+    warmup_steps: int = 0,
+    end_mult: float = 0.0,
     optimizer_name: str = "adam",
 ):
+    minibatch_size = min(minibatch_size, batch_size)
     print("LR", lr, "batch_size", batch_size, "minibatch_size", minibatch_size)
     assert batch_size % minibatch_size == 0, "batch size must be divisible by minibatch size"
     # we purposefully turn off dropout, for determinism
@@ -61,11 +67,20 @@ def train_model(
 
     nsteps = len(ds) * epochs // batch_size
 
-    def lr_schedule_fn(step):
-        if lr_schedule == "constant":
-            return 1
-        else:
-            assert False, f"invalid lr schedule, {lr_schedule}, must be constant or cosine_anneal"
+    def constant_lr_schedule_fn(step):
+        # linear warmup for warmup_iters steps
+        if step < warmup_steps:
+            return step / warmup_steps
+        return 1
+            
+    def cosine_lr_schedule_fn(step):
+        # linear warmup for warmup_iters steps
+        if step < warmup_steps:
+            return step / warmup_steps
+        # After warmup, cosine decay down to min learning rate
+        decay_ratio = (step - warmup_steps) / (nsteps - warmup_steps)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+        return coeff * (1 - end_mult) + end_mult
 
     if optimizer_name.lower() == "adam":
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -74,9 +89,11 @@ def train_model(
     else:
         assert False, f"invalid optimizer {optimizer_name}, must be adam or adafactor"
     if lr_schedule == "cosine_anneal":
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, nsteps)
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, cosine_lr_schedule_fn)
+    elif lr_schedule == "constant":
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, constant_lr_schedule_fn)
     else:
-        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule_fn)
+        raise ValueError(f"invalid lr schedule, {lr_schedule}, must be constant or cosine_anneal")
     step = 0
     it = itertools.chain.from_iterable(itertools.repeat(ds, epochs))
     losses = []
@@ -169,12 +186,14 @@ def train_and_save_model(
     train_ds: datasets.Dataset,
     test_ds: datasets.Dataset,
     inference_ds: Optional[datasets.Dataset] = None,
+    additional_eval_ds: Optional[datasets.Dataset] = None,
     *,
     batch_size: int,
     lr: float,
     epochs: int,
     eval_batch_size: Optional[int] = None,
     minibatch_size_per_device: Optional[int] = None,
+    load_path: Optional[str] = None,
     save_path: Optional[str] = None,
     loss_fn: Callable = xent_loss,
     label: str = "default",
@@ -182,6 +201,8 @@ def train_and_save_model(
     train_with_dropout: bool = False,
     linear_probe: bool = False,
     lr_schedule: str = "constant",
+    warmup_steps: int = 0,
+    end_mult: float = 0.0,
     optimizer_name: str = "adam",
     eval_every: Optional[int] = None,
 ):
@@ -195,19 +216,20 @@ def train_and_save_model(
     custom_kwargs = model_config.custom_kwargs or {}
 
     def maybe_load_model(model):
-        if os.path.exists(os.path.join(save_path, "results.pkl")) and not force_retrain:
-            print("loading from", save_path)
-            checkpoint_path = os.path.join(save_path, "pytorch_model.bin")
+        if os.path.exists(os.path.join(load_path, "results.pkl")):
+            print("loading from", load_path)
+            checkpoint_path = os.path.join(load_path, "pytorch_model.bin")
             if not os.path.exists(checkpoint_path):
                 # Assume this means we have a sharded checkpoint, and load it appropriately
-                load_sharded_checkpoint(model, checkpoint_path)
+                load_sharded_checkpoint(model, load_path)
             else:
-                state_dict = torch.load(os.path.join(save_path, "pytorch_model.bin"))
+                state_dict = torch.load(os.path.join(load_path, "pytorch_model.bin"))
                 state_dict = {
                     k.replace("transformer.module", "transformer"): v
                     for (k, v) in state_dict.items()
                 }
                 custom_kwargs["state_dict"] = state_dict
+                model.load_state_dict(state_dict)
             return True
         return False
 
@@ -245,8 +267,16 @@ def train_and_save_model(
         else:
             minibatch_size = minibatch_size_per_device
 
-    if already_trained:
-        test_results = eval_model_acc(model, test_ds, eval_batch_size)
+    if not force_retrain and already_trained:
+        if load_path != save_path and os.path.exists(os.path.join(load_path, "results.pkl")):
+            os.makedirs(save_path, exist_ok=True)
+            copy_tree(load_path, save_path)
+            with open(os.path.join(save_path, "results.pkl"), "rb") as f:
+                results_data = pickle.load(f)
+            test_results = results_data["test_results"]
+        else:
+            # return results_data["test_results"], results_data["inference_results"]
+            test_results = eval_model_acc(model, test_ds, eval_batch_size)
     else:
         start = time.time()
         test_results = train_model(
@@ -263,20 +293,27 @@ def train_and_save_model(
             minibatch_size=minibatch_size,
             train_with_dropout=train_with_dropout,
             lr_schedule=lr_schedule,
+            warmup_steps=warmup_steps,
+            end_mult=end_mult,
             optimizer_name=optimizer_name,
         )
         print("Model training took", time.time() - start, "seconds")
-        if save_path:
-            # Note: If the model is wrapped by DataParallel, we need to unwrap it before saving
-            (model if hasattr(model, "save_pretrained") else model.module).save_pretrained(
-                save_path
-            )
-            print("saved", save_path)
+    if save_path:
+        # Note: If the model is wrapped by DataParallel, we need to unwrap it before saving
+        (model if hasattr(model, "save_pretrained") else model.module).save_pretrained(
+            save_path, safe_serialization=False,
+        )
+        print("saved", save_path)
 
     inference_results = None
     if inference_ds:
         inference_results = eval_model_acc(model, inference_ds, eval_batch_size)
         logger.logkv("inference_accuracy", np.mean([r["acc"] for r in inference_results]))
+    
+    additional_eval_results = None
+    if additional_eval_ds:
+        additional_eval_results = eval_model_acc(model, additional_eval_ds, eval_batch_size)
+        logger.logkv("additional_eval_accuracy", np.mean([r["acc"] for r in additional_eval_results]))
 
     if save_path:
         with open(os.path.join(save_path, "results.pkl"), "wb") as f:
@@ -288,6 +325,7 @@ def train_and_save_model(
                     ),
                     "test_results": test_results,
                     "inference_results": inference_results if inference_results else [],
+                    "additional_eval_results": additional_eval_results if additional_eval_results else [],
                 },
                 f,
             )

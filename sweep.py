@@ -1,3 +1,4 @@
+import time
 import os
 import subprocess
 import sys
@@ -7,6 +8,7 @@ import fire
 
 
 def main(model_sizes: Union[List[str], str], **kwargs):
+    start = time.time()
     if isinstance(model_sizes, str):
         model_sizes = model_sizes.split(",")
     assert (
@@ -33,7 +35,10 @@ def main(model_sizes: Union[List[str], str], **kwargs):
                 + ["--weak_model_size", weak_model_size, "--model_size", strong_model_size],
                 check=True,
             )
-
+    end = time.time()
+    print("#############################################")
+    print(f"Total time took: {end - start}")
+    print("#############################################")
 
 if __name__ == "__main__":
     fire.Fire(main)
